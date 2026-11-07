@@ -22,9 +22,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: FedericoCarboni/setup-ffmpeg@v3
+      - if: runner.os != 'macOS'
+        uses: FedericoCarboni/setup-ffmpeg@v3
         with:
           ffmpeg-version: release
+
+      - if: runner.os == 'macOS'   # the action above is x64-only; macOS runners are Apple Silicon
+        run: brew install ffmpeg
 
       - uses: actions/cache@v4
         with:
