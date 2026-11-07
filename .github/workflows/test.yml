@@ -1,0 +1,71 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash   # Git Bash on Windows, same as Claude Code uses there
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/pip
+            ~/AppData/Local/pip/Cache
+          key: hf-pip-${{ runner.os }}-v1
+
+      - name: Setup (as the skill runs it)
+        run: |
+          PY=$(python skills/make-3d/scripts/setup.py)
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      - name: Make test clips (16:9 and 2.39:1, with audio)
+        run: |
+          ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=640x360:rate=24 -f lavfi -i sine=frequency=440 \
+            -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest clip.mp4
+          ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=640x268:rate=24 -t 2 -c:v libx264 -pix_fmt yuv420p wide.mp4
+
+      - name: Convert every preset and check the output
+        run: |
+          set -e
+          check() {  # file expected_WxH expect_audio
+            dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$1" | tr -d '\r')
+            frames=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$1" | tr -d '\r')
+            audio=$(ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$1" | tr -d '\r' | head -1)
+            echo "$1: $dims, $frames frames, audio=${audio:-none}"
+            [ "$dims" = "$2" ] || { echo "expected $2"; exit 1; }
+            [ "$frames" -ge 40 ] || { echo "too few frames"; exit 1; }
+            if [ "$3" = "yes" ]; then [ "$audio" = "audio" ] || { echo "audio missing"; exit 1; }; fi
+          }
+          "$PY" skills/make-3d/scripts/convert3d.py clip.mp4 --preset glasses
+          check clip_3D_anaglyph.mp4 640x360 yes
+          "$PY" skills/make-3d/scripts/convert3d.py clip.mp4 --preset projector
+          check clip.3D.HSBS.mp4 1920x1080 yes
+          "$PY" skills/make-3d/scripts/convert3d.py clip.mp4 --preset vr
+          check clip_3D_LRF_Full_SBS.mp4 1280x360 yes
+          "$PY" skills/make-3d/scripts/convert3d.py clip.mp4 --preset tv --format tb -o tb.mp4
+          check tb.mp4 1920x1080 yes
+          "$PY" skills/make-3d/scripts/convert3d.py wide.mp4 --preset projector --swap-eyes --save-depth wide_depth.mp4
+          check wide.3D.HSBS.mp4 1920x1080 no
+          check wide_depth.mp4 640x268 no

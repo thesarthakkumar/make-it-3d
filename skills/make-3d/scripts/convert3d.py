@@ -27,6 +27,16 @@ FORMATS = {
     "hsbs": "half side-by-side (same width as the source), for most 3D TVs and projectors",
     "tb": "top-bottom (over-under), for some 3D TVs and players",
 }
+PRESETS = {  # sensible defaults per screen; any explicit flag still wins
+    "glasses":   dict(format="anaglyph", strength=2.0, pop=0.3, size=None),
+    "vr":        dict(format="sbs", strength=2.0, pop=0.3, size=None),
+    "tv":        dict(format="hsbs", strength=2.0, pop=0.3, size=(1920, 1080)),
+    # big screens magnify disparity, so keep it gentler and mostly behind the screen
+    "projector": dict(format="hsbs", strength=1.5, pop=0.2, size=(1920, 1080)),
+}
+SUFFIX = {  # names that VR players (Skybox, DeoVR) and Kodi recognise automatically
+    "anaglyph": "_3D_anaglyph", "sbs": "_3D_LRF_Full_SBS", "hsbs": ".3D.HSBS", "tb": ".3D.HTAB",
+}
 MODELS = {  # Small is Apache-2.0; Base/Large are CC-BY-NC-4.0 (non-commercial only)
     "small": "depth-anything/Depth-Anything-V2-Small-hf",
     "base": "depth-anything/Depth-Anything-V2-Base-hf",
@@ -101,7 +111,7 @@ class Stabiliser:
         self.cuts = 0
 
     def is_cut(self, rgb):
-        t = F.interpolate(rgb[None], (36, 64), mode="area")[0]
+        t = F.interpolate(rgb[None], (36, 64), mode="bilinear", antialias=True, align_corners=False)[0]
         cut = self.thumb is not None and (t - self.thumb).abs().mean().item() > self.cut
         self.thumb = t
         return cut
@@ -188,6 +198,19 @@ def to_srgb(x):
     return torch.where(x <= 0.0031308, x * 12.92, 1.055 * x.clamp(min=1e-8) ** (1 / 2.4) - 0.055)
 
 
+def fit(img, size):
+    """Scale an eye view to fit inside size=(w, h) keeping aspect, padding with black (letterbox)."""
+    if not size:
+        return img
+    cw, ch = size
+    _, h, w = img.shape
+    s = min(cw / w, ch / h)
+    nw, nh = max(2, round(w * s / 2) * 2), max(2, round(h * s / 2) * 2)
+    img = F.interpolate(img[None], (nh, nw), mode="bicubic", align_corners=False, antialias=True)[0].clamp(0, 1)
+    px, py = (cw - nw) // 2, (ch - nh) // 2
+    return F.pad(img, (px, cw - nw - px, py, ch - nh - py))
+
+
 def pack(L, R, fmt, ML, MR):
     if fmt == "anaglyph":
         out = torch.einsum("ij,jhw->ihw", ML, to_lin(L)) + torch.einsum("ij,jhw->ihw", MR, to_lin(R))
@@ -195,9 +218,9 @@ def pack(L, R, fmt, ML, MR):
     if fmt == "sbs":
         return torch.cat([L, R], 2)
     if fmt == "hsbs":
-        return F.interpolate(torch.cat([L, R], 2)[None], L.shape[1:], mode="area")[0]
+        return F.interpolate(torch.cat([L, R], 2)[None], L.shape[1:], mode="bilinear", antialias=True, align_corners=False)[0]
     if fmt == "tb":
-        return F.interpolate(torch.cat([L, R], 1)[None], L.shape[1:], mode="area")[0]
+        return F.interpolate(torch.cat([L, R], 1)[None], L.shape[1:], mode="bilinear", antialias=True, align_corners=False)[0]
     raise ValueError(fmt)
 
 
@@ -205,11 +228,15 @@ def main():
     ap = argparse.ArgumentParser(description="Convert a 2D video to 3D.")
     ap.add_argument("input")
     ap.add_argument("-o", "--output", help="output path (default: <input>_3D_<format>.mp4 next to the input)")
-    ap.add_argument("--format", choices=FORMATS, default="anaglyph")
-    ap.add_argument("--strength", type=float, default=2.0,
+    ap.add_argument("--preset", choices=PRESETS, default="glasses",
+                    help="glasses (anaglyph), vr (full SBS), tv (half SBS 1080p), projector (half SBS 1080p, gentler depth)")
+    ap.add_argument("--format", choices=FORMATS, help="override the preset's packing")
+    ap.add_argument("--strength", type=float,
                     help="3D strength: total eye separation as %% of width (1.0 subtle, 2.0 default, 3.0 strong)")
-    ap.add_argument("--pop", type=float, default=0.3,
+    ap.add_argument("--pop", type=float,
                     help="share of the depth range in front of the screen (0 = all behind, 0.3 default, 0.6 lots of pop-out)")
+    ap.add_argument("--size", help="output frame WxH, letterboxed to fit (e.g. 1920x1080); 'source' keeps the input size")
+    ap.add_argument("--swap-eyes", action="store_true", help="swap left/right (if the 3D looks inside-out)")
     ap.add_argument("--start", help="start time (seconds or HH:MM:SS)")
     ap.add_argument("--duration", help="length to convert (seconds or HH:MM:SS)")
     ap.add_argument("--model", default="small", help="small (Apache-2.0, default) | base | large (non-commercial licence)")
@@ -221,20 +248,31 @@ def main():
     ap.add_argument("--device", default="auto")
     ap.add_argument("--save-depth", help="also write the depth video here (white = near)")
     a = ap.parse_args()
+    pre = PRESETS[a.preset]
+    a.format = a.format or pre["format"]
+    a.strength = pre["strength"] if a.strength is None else a.strength
+    a.pop = pre["pop"] if a.pop is None else a.pop
+    if a.size == "source":
+        size = None
+    elif a.size:
+        size = tuple(int(v) for v in a.size.lower().split("x"))
+    else:
+        size = pre["size"]
 
     src = os.path.abspath(a.input)
     W0, H0, fps, total = probe(src)
-    W, H = W0, H0
+    W, H = W0 - W0 % 2, H0 - H0 % 2  # H.264 4:2:0 needs even sizes
     if W > a.max_width:
-        W, H = a.max_width, int(round(H0 * a.max_width / W0 / 2) * 2)
-    out = a.output or os.path.splitext(src)[0] + f"_3D_{a.format}.mp4"
+        W, H = a.max_width - a.max_width % 2, int(round(H0 * a.max_width / W0 / 2) * 2)
+    out = a.output or os.path.splitext(src)[0] + SUFFIX[a.format] + ".mp4"
+    EW, EH = size or (W, H)  # per-eye frame size after letterboxing
     start, dur = parse_time(a.start), parse_time(a.duration)
     span = dur if dur else max(total - (start or 0), 0)
     fps_f = float(Fraction(fps))
     est = int(span * fps_f) if span else 0
 
     dev = pick_device(a.device)
-    print(f"[make-it-3d] {os.path.basename(src)} {W0}x{H0} @ {fps_f:.3f} fps -> {a.format} {W}x{H}, device={dev}",
+    print(f"[make-it-3d] {os.path.basename(src)} {W0}x{H0} @ {fps_f:.3f} fps -> {a.preset}/{a.format} eye {EW}x{EH}, strength {a.strength}, pop {a.pop}, device={dev}",
           flush=True)
 
     seek = (["-ss", str(start)] if start else [])
@@ -242,13 +280,13 @@ def main():
     rd = subprocess.Popen(["ffmpeg", "-loglevel", "error"] + seek + ["-i", src] + length +
                           ["-map", "0:v:0", "-vf", f"scale={W}:{H}:flags=lanczos", "-f", "rawvideo",
                            "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
-    OW = W * 2 if a.format == "sbs" else W
+    OW = EW * 2 if a.format == "sbs" else EW
     vcodec = ["-c:v", "libx264", "-crf", str(a.crf), "-preset", "medium", "-pix_fmt", "yuv420p"]
     meta = []
-    if a.format in ("sbs", "hsbs", "tb"):
+    if a.format in ("sbs", "hsbs", "tb") and out.lower().endswith(".mkv"):
         meta = ["-metadata:s:v:0", "stereo_mode=" + {"sbs": "left_right", "hsbs": "left_right", "tb": "top_bottom"}[a.format]]
     wr = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-                           "-s", f"{OW}x{H}", "-r", fps, "-i", "-"] + seek + ["-i", src] + length +
+                           "-s", f"{OW}x{EH}", "-r", fps, "-i", "-"] + seek + ["-i", src] + length +
                           ["-map", "0:v", "-map", "1:a?", "-c:a", "aac", "-b:a", "192k", "-shortest"] +
                           vcodec + meta + ["-movflags", "+faststart", out], stdin=subprocess.PIPE)
     dw = None
@@ -291,7 +329,9 @@ def main():
                 bg = -F.max_pool2d(-disp[None, None], (1, bg_k), stride=1, padding=(0, bg_k // 2))[0, 0]
                 L = stereo.view(img, disp, +1, bg)
                 R = stereo.view(img, disp, -1, bg)
-                o = pack(L, R, a.format, ML, MR)
+                if a.swap_eyes:
+                    L, R = R, L
+                o = pack(fit(L, size), fit(R, size), a.format, ML, MR)
                 wr.stdin.write((o * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu().numpy().tobytes())
                 n += 1
             if n % (a.batch * 30) < a.batch:

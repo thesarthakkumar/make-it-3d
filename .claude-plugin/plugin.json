@@ -1,7 +1,7 @@
 {
   "name": "make-it-3d",
-  "version": "0.1.0",
-  "description": "Convert any 2D video or movie into 3D: red-cyan anaglyph for paper glasses, side-by-side for VR headsets, half-SBS / top-bottom for 3D TVs. Local AI depth estimation.",
+  "version": "0.2.0",
+  "description": "Convert any 2D video or movie into 3D: red-cyan anaglyph for paper glasses, side-by-side for VR headsets, half-SBS 1080p for 3D projectors and 3D TVs. macOS, Windows, Linux. Local AI depth estimation.",
   "author": { "name": "Sarthak Kumar", "url": "https://github.com/thesarthakkumar" },
   "repository": "https://github.com/thesarthakkumar/make-it-3d",
   "license": "MIT",
