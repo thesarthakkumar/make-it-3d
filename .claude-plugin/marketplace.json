@@ -1,0 +1,11 @@
+{
+  "name": "make-it-3d",
+  "owner": { "name": "Sarthak Kumar", "url": "https://github.com/thesarthakkumar" },
+  "plugins": [
+    {
+      "name": "make-it-3d",
+      "source": "./",
+      "description": "Convert any 2D video or movie into 3D (anaglyph, SBS, half-SBS, top-bottom) with local AI depth estimation."
+    }
+  ]
+}
