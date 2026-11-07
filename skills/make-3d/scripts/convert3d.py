@@ -3,8 +3,9 @@
 
 Pipeline (one streaming pass, no temp frames on disk):
   1. decode frames with ffmpeg
-  2. monocular depth per frame (Depth Anything V2, batched, fp16 on MPS/CUDA)
-  3. temporal stabilisation: EMA-normalised depth range + frame blending, both reset on scene cuts
+  2. depth: Video Depth Anything Small (default, temporally consistent, streamed in 32-frame
+     windows) or per-frame Depth Anything V2 (--model fast); or reuse a saved depth video (--depth-in)
+  3. temporal stabilisation: EMA-normalised depth range + light frame blending, reset on scene cuts
   4. edge dilation (foreground grows a few px so edges don't ghost)
   5. stereo synthesis per eye: z-ordered forward splatting at 2x horizontal supersampling,
      disocclusion holes filled from the background side
@@ -37,7 +38,8 @@ PRESETS = {  # sensible defaults per screen; any explicit flag still wins
 SUFFIX = {  # names that VR players (Skybox, DeoVR) and Kodi recognise automatically
     "anaglyph": "_3D_anaglyph", "sbs": "_3D_LRF_Full_SBS", "hsbs": ".3D.HSBS", "tb": ".3D.HTAB",
 }
-MODELS = {  # Small is Apache-2.0; Base/Large are CC-BY-NC-4.0 (non-commercial only)
+MODELS = {  # per-frame models. Small is Apache-2.0; Base/Large are CC-BY-NC-4.0 (non-commercial only)
+    "fast": "depth-anything/Depth-Anything-V2-Small-hf",
     "small": "depth-anything/Depth-Anything-V2-Small-hf",
     "base": "depth-anything/Depth-Anything-V2-Base-hf",
     "large": "depth-anything/Depth-Anything-V2-Large-hf",
@@ -101,29 +103,34 @@ class Depth:
         return F.interpolate(d, (H, W), mode="bicubic", align_corners=False)[:, 0]
 
 
+class CutDetector:
+    """Flags the first frame of a new shot (mean change of a 64x36 thumbnail)."""
+
+    def __init__(self, thresh=0.13):
+        self.thresh, self.thumb, self.cuts = thresh, None, 0
+
+    def __call__(self, rgb):
+        t = F.interpolate(rgb[None], (36, 64), mode="bilinear", antialias=True, align_corners=False)[0]
+        cut = self.thumb is not None and (t - self.thumb).abs().mean().item() > self.thresh
+        self.thumb = t
+        self.cuts += int(cut)
+        return cut
+
+
 class Stabiliser:
     """Normalises depth to 0..1 with an EMA'd percentile range and blends frames,
     resetting both at scene cuts so a new shot never inherits the old one's depth."""
 
-    def __init__(self, decay=0.9, blend=0.35, cut_thresh=0.13):
-        self.decay, self.blend, self.cut = decay, blend, cut_thresh
-        self.lo = self.hi = self.prev = self.thumb = None
-        self.cuts = 0
+    def __init__(self, decay=0.9, blend=0.35):
+        self.decay, self.blend = decay, blend
+        self.lo = self.hi = self.prev = None
 
-    def is_cut(self, rgb):
-        t = F.interpolate(rgb[None], (36, 64), mode="bilinear", antialias=True, align_corners=False)[0]
-        cut = self.thumb is not None and (t - self.thumb).abs().mean().item() > self.cut
-        self.thumb = t
-        return cut
-
-    def __call__(self, d, rgb):
-        cut = self.is_cut(rgb)
+    def __call__(self, d, cut):
         sample = d[::8, ::8].flatten().float()
         q = torch.quantile(sample, torch.tensor([0.02, 0.98], device=d.device))
         lo, hi = q[0].item(), q[1].item()
         if self.lo is None or cut:
             self.lo, self.hi, self.prev = lo, hi, None
-            self.cuts += int(cut)
         else:
             self.lo = self.decay * self.lo + (1 - self.decay) * lo
             self.hi = self.decay * self.hi + (1 - self.decay) * hi
@@ -224,6 +231,82 @@ def pack(L, R, fmt, ML, MR):
     raise ValueError(fmt)
 
 
+def read_frames(proc, W, H, ch=3):
+    size = W * H * ch
+    while True:
+        b = proc.stdout.read(size)
+        if len(b) < size:
+            return
+        yield torch.frombuffer(bytearray(b), dtype=torch.uint8).view(H, W, ch) if ch > 1 else \
+            torch.frombuffer(bytearray(b), dtype=torch.uint8).view(H, W)
+
+
+def to_dev(u8, dev):
+    return u8.to(dev).permute(2, 0, 1).float() / 255
+
+
+def frames_fast(frames, a, dev, H, W, cutdet):
+    """Per-frame Depth Anything V2, batched. Yields (rgb, depth 0..1)."""
+    depth = Depth(a.model, dev, a.depth_res or 294)
+    stab = Stabiliser(blend=0.35)
+    batch = []
+
+    def run(batch):
+        rgb = torch.stack([to_dev(f, dev) for f in batch])
+        raw = depth(rgb)
+        for i in range(rgb.shape[0]):
+            yield rgb[i], stab(raw[i], cutdet(rgb[i]))
+
+    for f in frames:
+        batch.append(f)
+        if len(batch) == a.batch:
+            yield from run(batch)
+            batch = []
+    if batch:
+        yield from run(batch)
+
+
+def frames_vda(frames, a, dev, H, W, cutdet):
+    """Video Depth Anything streamed in 32-frame windows, restarted at scene cuts."""
+    from vda_stream import VDAStream
+    enc = {"vda": "vits", "vda-base": "vitb", "vda-large": "vitl"}[a.model]
+    vda = VDAStream(enc, dev, a.depth_res or 392)
+    stab = Stabiliser(blend=0.1)  # the model is already temporally consistent
+    queue = []  # (uint8 frame on CPU, is_cut) waiting for their depth
+
+    def emit(depths):
+        for dep in depths:
+            f, cut = queue.pop(0)
+            d = F.interpolate(dep[None, None], (H, W), mode="bicubic", align_corners=False)[0, 0]
+            yield to_dev(f, dev), stab(d, cut)
+
+    for f in frames:
+        rgb = to_dev(f, dev)
+        cut = cutdet(rgb)
+        if cut:
+            yield from emit(vda.flush())
+        queue.append((f, cut))
+        yield from emit(vda.push(rgb))
+    yield from emit(vda.flush())
+
+
+def frames_depth_in(frames, path, start, length, dev, H, W):
+    """Reuse a depth video written earlier with --save-depth (white = near).
+    If it covers the whole source (e.g. a full-movie depth pass) it is seeked to --start like the
+    source; if it is shorter, it is assumed to already start at --start."""
+    seek = []
+    if start:
+        dlen = probe(path)[3]
+        if dlen >= start + 1:
+            seek = ["-ss", str(start)]
+    p = subprocess.Popen(["ffmpeg", "-loglevel", "error"] + seek + ["-i", path] + length +
+                         ["-vf", f"scale={W}:{H}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                         stdout=subprocess.PIPE)
+    for f, d in zip(frames, read_frames(p, W, H, 1)):
+        yield to_dev(f, dev), d.to(dev).float() / 255
+    p.kill()
+
+
 def main():
     ap = argparse.ArgumentParser(description="Convert a 2D video to 3D.")
     ap.add_argument("input")
@@ -239,14 +322,18 @@ def main():
     ap.add_argument("--swap-eyes", action="store_true", help="swap left/right (if the 3D looks inside-out)")
     ap.add_argument("--start", help="start time (seconds or HH:MM:SS)")
     ap.add_argument("--duration", help="length to convert (seconds or HH:MM:SS)")
-    ap.add_argument("--model", default="small", help="small (Apache-2.0, default) | base | large (non-commercial licence)")
-    ap.add_argument("--depth-res", type=int, default=294, help="depth model input short side (multiple of 14)")
+    ap.add_argument("--model", default="vda",
+                    help="vda (Video Depth Anything Small, default: steadiest, Apache-2.0) | fast (per-frame "
+                         "Depth Anything V2 Small, ~3x faster, more shimmer) | base | large | vda-large "
+                         "(base/large variants are non-commercial)")
+    ap.add_argument("--depth-res", type=int, help="depth model input short side (default 392 for vda, 294 for fast)")
+    ap.add_argument("--depth-in", help="reuse a depth video saved earlier with --save-depth (skips the model)")
     ap.add_argument("--max-width", type=int, default=1920, help="downscale wider sources to this width")
     ap.add_argument("--edge-dilation", type=int, default=2)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--crf", type=int, default=17)
     ap.add_argument("--device", default="auto")
-    ap.add_argument("--save-depth", help="also write the depth video here (white = near)")
+    ap.add_argument("--save-depth", help="also write the depth video here (white = near); reuse it with --depth-in")
     a = ap.parse_args()
     pre = PRESETS[a.preset]
     a.format = a.format or pre["format"]
@@ -295,57 +382,52 @@ def main():
                                "-s", f"{W}x{H}", "-r", fps, "-i", "-", "-c:v", "libx264", "-crf", "14",
                                "-pix_fmt", "yuv420p", a.save_depth], stdin=subprocess.PIPE)
 
-    depth = Depth(a.model, dev, a.depth_res)
-    stab = Stabiliser()
+    cutdet = CutDetector()
+    frames = read_frames(rd, W, H)
+    if a.depth_in:
+        source = frames_depth_in(frames, a.depth_in, start, length, dev, H, W)
+        a.model = "depth-in"
+    elif a.model.startswith("vda"):
+        source = frames_vda(frames, a, dev, H, W, cutdet)
+    else:
+        source = frames_fast(frames, a, dev, H, W, cutdet)
+    print(f"[make-it-3d] depth: {a.model}", flush=True)
     stereo = Stereo(H, W, dev)
     ML = torch.tensor(DUBOIS_L, device=dev)
     MR = torch.tensor(DUBOIS_R, device=dev)
     maxd = a.strength / 100 * W  # total disparity range in px
     bg_k = max(3, int(maxd) | 1)
 
-    fsize = W * H * 3
     n, t0 = 0, time.time()
     with torch.no_grad():
-        done = False
-        while not done:
-            frames = []
-            for _ in range(a.batch):
-                b = rd.stdout.read(fsize)
-                if len(b) < fsize:
-                    done = True
-                    break
-                frames.append(torch.frombuffer(bytearray(b), dtype=torch.uint8).view(H, W, 3))
-            if not frames:
-                break
-            rgb = torch.stack(frames).to(dev).permute(0, 3, 1, 2).float() / 255
-            raw = depth(rgb)
-            for i in range(rgb.shape[0]):
-                img = rgb[i]
-                d = stab(raw[i], img)
-                if dw:
-                    dw.stdin.write((d * 255).byte().cpu().numpy().tobytes())
-                d = dilate_foreground(d, a.edge_dilation)
-                disp = maxd * (d - a.pop)
-                bg = -F.max_pool2d(-disp[None, None], (1, bg_k), stride=1, padding=(0, bg_k // 2))[0, 0]
-                L = stereo.view(img, disp, +1, bg)
-                R = stereo.view(img, disp, -1, bg)
-                if a.swap_eyes:
-                    L, R = R, L
-                o = pack(fit(L, size), fit(R, size), a.format, ML, MR)
-                wr.stdin.write((o * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu().numpy().tobytes())
-                n += 1
-            if n % (a.batch * 30) < a.batch:
-                el = time.time() - t0
-                rate = n / el
-                eta = f", ~{(est - n) / rate / 60:.1f} min left" if est > n else ""
+        for img, d in source:
+            if dw:
+                dw.stdin.write((d * 255 + 0.5).byte().cpu().numpy().tobytes())
+            d = dilate_foreground(d, a.edge_dilation)
+            disp = maxd * (d - a.pop)
+            bg = -F.max_pool2d(-disp[None, None], (1, bg_k), stride=1, padding=(0, bg_k // 2))[0, 0]
+            L = stereo.view(img, disp, +1, bg)
+            R = stereo.view(img, disp, -1, bg)
+            if a.swap_eyes:
+                L, R = R, L
+            o = pack(fit(L, size), fit(R, size), a.format, ML, MR)
+            wr.stdin.write((o * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu().numpy().tobytes())
+            n += 1
+            if n % 480 == 0:
+                rate = n / (time.time() - t0)
+                eta = f", ~{(est - n) / rate / 60:.0f} min left" if est > n else ""
                 print(f"[make-it-3d] {n}{'/' + str(est) if est else ''} frames, {rate:.1f} fps{eta}", flush=True)
 
+    if rd.poll() is None:  # depth ran out before the video (short --depth-in): stop the reader
+        rd.kill()
     rd.wait()
     wr.stdin.close(); wr.wait()
     if dw:
         dw.stdin.close(); dw.wait()
     el = time.time() - t0
-    print(f"[make-it-3d] done: {n} frames in {el / 60:.1f} min, {stab.cuts} scene cuts -> {out}", flush=True)
+    if est and n < est - 2:
+        print(f"[make-it-3d] warning: wrote {n} frames, expected about {est}", flush=True)
+    print(f"[make-it-3d] done: {n} frames in {el / 60:.1f} min, {cutdet.cuts} scene cuts -> {out}", flush=True)
     if wr.returncode != 0:
         sys.exit("ffmpeg encode failed")
 

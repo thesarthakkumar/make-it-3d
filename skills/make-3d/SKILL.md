@@ -1,6 +1,6 @@
 ---
 name: make-3d
-description: Convert any 2D video or movie into stereoscopic 3D - red-cyan anaglyph for paper 3D glasses, side-by-side for VR headsets (Quest, Vision Pro players), half side-by-side 1080p for 3D projectors (Epson, BenQ, Optoma, ViewSonic, DLP-Link) and 3D TVs. Use whenever the user asks to make a video/movie/clip "3D", "watch with 3D glasses", "red cyan", "anaglyph", "SBS", "for my projector", "for my VR headset" or "for my 3D TV". Runs locally on macOS, Windows or Linux with Depth Anything V2 depth estimation; no cloud upload.
+description: Convert any 2D video or movie into stereoscopic 3D - red-cyan anaglyph for paper 3D glasses, side-by-side for VR headsets (Quest, Vision Pro players), half side-by-side 1080p for 3D projectors (Epson, BenQ, Optoma, ViewSonic, DLP-Link) and 3D TVs. Use whenever the user asks to make a video/movie/clip "3D", "watch with 3D glasses", "red cyan", "anaglyph", "SBS", "for my projector", "for my VR headset" or "for my 3D TV". Runs locally on macOS, Windows or Linux with Video Depth Anything (temporally consistent depth); no cloud upload.
 ---
 
 # make-3d
@@ -44,11 +44,18 @@ GPU is present. Without a GPU it runs on CPU, which is slow: warn the user befor
 Pick a start time with people or objects at different distances (skip opening credits). Pull a
 frame from the preview and look at it before the full run.
 
-## 4. Full render (run in the background; on an Apple M-series or mid-range NVIDIA GPU expect roughly 1-1.5x the video's length at 720p-1080p)
+## 4. Full render (run it in the background)
+
+On an Apple M5 the default model runs at about 10 fps at 720p (a 1-hour episode takes about 2.5 hours);
+`--model fast` is about 3x faster with more shimmer. Save the depth so other formats are quick later:
 
 ```bash
-"$PY" "$SKILL_DIR/scripts/convert3d.py" "INPUT" --preset projector
+"$PY" "$SKILL_DIR/scripts/convert3d.py" "INPUT" --preset projector --save-depth "INPUT_depth.mp4"
+# later, another format from the same depth (skips the model, ~2x faster):
+"$PY" "$SKILL_DIR/scripts/convert3d.py" "INPUT" --preset glasses --depth-in "INPUT_depth.mp4"
 ```
+
+On macOS keep the Mac awake for long renders (`caffeinate -i -w <pid>`).
 
 Default output sits next to the input with a name players auto-detect:
 `name_3D_anaglyph.mp4`, `name.3D.HSBS.mp4` / `name.3D.HTAB.mp4` (Kodi), `name_3D_LRF_Full_SBS.mp4` (Skybox, DeoVR).
@@ -73,10 +80,10 @@ Audio is copied across (as AAC). Subtitles are not carried over.
 | `--size` | preset | Output frame `WxH`, letterboxed. `source` keeps the input size. |
 | `--swap-eyes` | off | Swap left/right. |
 | `--edge-dilation` | 2 | Grows the foreground a few px to hide halos. 0 sharper, 4 gentlest. |
-| `--model` | small | `base`/`large` are sharper but CC-BY-NC (non-commercial) and slower. |
+| `--model` | vda | Video Depth Anything Small: steadiest depth. `fast` = per-frame Depth Anything V2 Small, ~3x faster, more shimmer. `large` / `vda-large` are non-commercial (CC-BY-NC) and much slower. |
+| `--save-depth` / `--depth-in` | off | Save the depth video, then reuse it for other formats without re-running the model. |
 | `--max-width` | 1920 | Wider sources (4K) are scaled down first. |
 | `--device` | auto | `mps`, `cuda` or `cpu`. |
-| `--save-depth PATH` | off | Also writes the depth video (white = near). |
 
 "More 3D": raise `--strength` (to 2.5-3, or 2 on a projector) and/or `--pop`.
 Eye strain or ghosting: lower `--strength` to 1-1.5 and `--pop` to 0.15.

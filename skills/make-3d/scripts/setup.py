@@ -10,11 +10,15 @@ python executable (the only thing written to stdout). Safe to re-run.
 
 Override the env location with MAKE3D_ENV, the PyTorch wheel index with MAKE3D_TORCH_INDEX.
 """
-import os, platform, shutil, subprocess, sys
+import io, os, platform, shutil, subprocess, sys, urllib.request, zipfile
 from pathlib import Path
 
 CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+VDA_COMMIT = "4f5ae23172ba60fd7bc11ef671cca678842c7072"  # keep in sync with vda_stream.py
+VDA_ZIP = f"https://github.com/DepthAnything/Video-Depth-Anything/archive/{VDA_COMMIT}.zip"
+PKGS = ["transformers", "huggingface_hub", "numpy", "pillow", "einops", "easydict",
+        "opencv-python-headless", "tqdm"]
 
 
 def log(msg):
@@ -32,6 +36,28 @@ def env_dir():
 
 def env_python(d):
     return d / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def vda_dir(env):
+    return env.parent / "src" / "Video-Depth-Anything"
+
+
+def fetch_vda(env):
+    """Download the pinned Video Depth Anything model code (Apache-2.0). No git needed."""
+    dest = vda_dir(env)
+    stamp = dest / ".commit"
+    if stamp.exists() and stamp.read_text().strip() == VDA_COMMIT:
+        return
+    log("Downloading Video Depth Anything code ...")
+    data = urllib.request.urlopen(VDA_ZIP, timeout=120).read()
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        root = z.namelist()[0].split("/")[0]
+        z.extractall(dest.parent)
+    (dest.parent / root).rename(dest)
+    stamp.write_text(VDA_COMMIT)
 
 
 def has_nvidia():
@@ -59,8 +85,12 @@ def main():
         d.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(d)], check=True)
 
-    ok = subprocess.run([str(py), "-c", "import torch, transformers"], capture_output=True).returncode == 0
+    check = "import torch, torchvision, transformers, einops, easydict, cv2"
+    ok = subprocess.run([str(py), "-c", check], capture_output=True).returncode == 0
     if not ok:
+        # envs made by uv have no pip; bootstrap it
+        if subprocess.run([str(py), "-m", "pip", "--version"], capture_output=True).returncode != 0:
+            subprocess.run([str(py), "-m", "ensurepip", "--upgrade"], check=True, capture_output=True)
         pip = [str(py), "-m", "pip", "install", "--disable-pip-version-check", "-q"]
         index = os.environ.get("MAKE3D_TORCH_INDEX")
         if not index and platform.system() != "Darwin":
@@ -72,8 +102,10 @@ def main():
                 log("No NVIDIA GPU found: installing the CPU build of PyTorch (slow for long videos).")
         log("Installing PyTorch + transformers (one time, 1-3 GB) ...")
         subprocess.run(pip + ["--upgrade", "pip"], check=True)
-        subprocess.run(pip + ["torch"] + (["--index-url", index] if index else []), check=True)
-        subprocess.run(pip + ["transformers", "numpy", "pillow"], check=True)
+        subprocess.run(pip + ["torch", "torchvision"] + (["--index-url", index] if index else []), check=True)
+        subprocess.run(pip + PKGS, check=True)
+
+    fetch_vda(d)
 
     print(str(py))
 

@@ -47,13 +47,21 @@ No 3D projector? Any projector shows the `glasses` (anaglyph) version; watch wit
 
 ## How it works
 
-1. **Depth**: [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) Small estimates depth for every frame (batched, fp16).
-2. **Temporal stability**: the depth range is EMA-normalised and frames are blended, with both reset at scene cuts so a new shot never inherits the last one's depth.
+1. **Depth**: [Video Depth Anything](https://github.com/DepthAnything/Video-Depth-Anything) Small (Apache-2.0) by default. It looks at 32 frames at a time, so depth stays steady from frame to frame. The upstream code loads a whole video into memory; make-it-3d streams it in overlapping windows (same alignment maths) so a full film runs in constant memory, restarts the window at every scene cut, and swaps the attention for PyTorch's fused SDPA, which made it about 5x faster on Apple Silicon and stopped it running out of memory. `--model fast` uses per-frame [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) Small instead.
+2. **Temporal stability**: the depth range is EMA-normalised and lightly blended, reset at scene cuts so a new shot never inherits the last one's depth.
 3. **Edge dilation**: the foreground grows by a couple of pixels so edges don't leave halos.
 4. **Stereo views**: each eye is rendered by z-ordered forward splatting at 2x horizontal supersampling (nearer surfaces win), and disoccluded gaps are filled from the background side.
 5. **Packing**: Dubois least-squares anaglyph in linear light, or SBS / half-SBS / TB, letterboxed to the preset's frame size (adds `stereo_mode` metadata when the output is .mkv). Audio is carried across.
 
-Speed on an Apple M5: about 13 fps at 720p, so a 1-hour 720p episode takes about 1.5 hours. A mid-range NVIDIA GPU is in the same range or faster; CPU-only is several times slower.
+Benchmark on an Apple M5 (20 s of 720p film, depth model only):
+
+| `--model` | Depth speed | Frame-to-frame flicker | Licence |
+|---|---|---|---|
+| `vda` (default) | 20 fps | 0.0023 | Apache-2.0 |
+| `fast` | 71 fps | 0.0044 | Apache-2.0 |
+| `large` | 9 fps | 0.0041 | CC-BY-NC |
+
+End to end with stereo rendering and encoding: about 10 fps with `vda` (a 1-hour 720p episode takes about 2.5 hours), about 13 fps with `fast`. Use `--save-depth` once, then `--depth-in` to make other formats at about 18 fps without re-running the model. A mid-range NVIDIA GPU is in the same range or faster; CPU-only is many times slower.
 
 ## Standalone CLI
 
@@ -79,9 +87,10 @@ $PY = python skills\make-3d\scripts\setup.py
 | `--size` | from preset | Output frame `WxH`, letterboxed; `source` keeps the input size. |
 | `--swap-eyes` | off | Swap left and right. |
 | `--edge-dilation` | 2 | Foreground growth in px. 0 sharper, 4 gentler on the eyes. |
-| `--model` | small | `base` / `large` are sharper but non-commercial (CC-BY-NC-4.0). |
+| `--model` | vda | `vda` (steadiest), `fast` (3x faster, more shimmer), `large` / `vda-large` (non-commercial, slow). |
+| `--depth-in` | off | Reuse a depth video from `--save-depth` instead of running the model. |
 | `--max-width` | 1920 | Wider sources are scaled down first. |
-| `--save-depth` | off | Also write the depth video. |
+| `--save-depth` | off | Also write the depth video (white = near). |
 
 ## Limits
 
@@ -94,7 +103,7 @@ $PY = python skills\make-3d\scripts\setup.py
 
 - [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2): the depth model (Small: Apache-2.0).
 - [iw3 / nunif](https://github.com/nagadomi/nunif): the most complete open-source 2D-to-3D converter. Its edge dilation, EMA depth normalisation and scene-cut handling inspired this pipeline. Use it if you want more depth models and ML-based warping.
-- [Video Depth Anything](https://github.com/DepthAnything/Video-Depth-Anything): temporally consistent video depth; a possible future backend.
+- [Video Depth Anything](https://github.com/DepthAnything/Video-Depth-Anything) (ByteDance, Apache-2.0 for Small): the default depth backend. setup.py downloads its code at a pinned commit.
 - [StereoCrafter](https://stereocrafter.github.io): diffusion-based stereo inpainting; the high-end of quality, needs a big GPU.
 
 ## License

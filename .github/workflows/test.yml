@@ -36,7 +36,7 @@ jobs:
             ~/.cache/huggingface
             ~/.cache/pip
             ~/AppData/Local/pip/Cache
-          key: hf-pip-${{ runner.os }}-v1
+          key: hf-pip-${{ runner.os }}-v2
 
       - name: Setup (as the skill runs it)
         run: |
@@ -73,3 +73,7 @@ jobs:
           "$PY" skills/make-3d/scripts/convert3d.py wide.mp4 --preset projector --swap-eyes --save-depth wide_depth.mp4
           check wide.3D.HSBS.mp4 1920x1080 no
           check wide_depth.mp4 640x268 no
+          "$PY" skills/make-3d/scripts/convert3d.py wide.mp4 --preset glasses --depth-in wide_depth.mp4 -o reuse.mp4
+          check reuse.mp4 640x268 no
+          "$PY" skills/make-3d/scripts/convert3d.py clip.mp4 --model fast -o fast.mp4
+          check fast.mp4 640x360 yes
