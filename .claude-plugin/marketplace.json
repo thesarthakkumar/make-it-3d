@@ -1,6 +1,12 @@
 {
   "name": "make-it-3d",
-  "owner": { "name": "Sarthak Kumar", "url": "https://github.com/thesarthakkumar" },
+  "owner": {
+    "name": "Sarthak Kumar",
+    "url": "https://github.com/thesarthakkumar"
+  },
+  "metadata": {
+    "description": "Convert any 2D video or movie into 3D for red-cyan glasses, VR headsets and 3D TVs."
+  },
   "plugins": [
     {
       "name": "make-it-3d",
